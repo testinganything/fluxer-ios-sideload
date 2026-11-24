@@ -138,21 +138,29 @@ jobs:
       - name: Install Rust
         run: |
           set -euo pipefail
-          if ! command -v cargo >/dev/null 2>&1; then
+          # The Xcode runner image ships a Homebrew cargo without rustup's env file.
+          if ! command -v rustup >/dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
               | sh -s -- -y --profile minimal --default-toolchain stable
           fi
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          # shellcheck disable=SC1090
-          . "$HOME/.cargo/env"
+          if [ -f "$HOME/.cargo/env" ]; then
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            # shellcheck disable=SC1091
+            . "$HOME/.cargo/env"
+          fi
+          command -v rustup
+          command -v cargo
           rustup target add aarch64-apple-ios
+          rustup show
 
       - name: Enable native assets and fetch packages
         working-directory: src
         run: |
           set -euo pipefail
-          # shellcheck disable=SC1090
-          . "$HOME/.cargo/env"
+          if [ -f "$HOME/.cargo/env" ]; then
+            # shellcheck disable=SC1091
+            . "$HOME/.cargo/env"
+          fi
           flutter config --enable-native-assets
           flutter pub get
 
@@ -160,8 +168,10 @@ jobs:
         working-directory: src
         run: |
           set -euo pipefail
-          # shellcheck disable=SC1090
-          . "$HOME/.cargo/env"
+          if [ -f "$HOME/.cargo/env" ]; then
+            # shellcheck disable=SC1091
+            . "$HOME/.cargo/env"
+          fi
           bash tool/prefetch_native_rust_toolchains.sh
           if [ -d fluxer ]; then
             (cd fluxer && rustup toolchain install && rustup target add aarch64-apple-ios)
@@ -183,8 +193,10 @@ jobs:
         working-directory: src
         run: |
           set -euo pipefail
-          # shellcheck disable=SC1090
-          . "$HOME/.cargo/env"
+          if [ -f "$HOME/.cargo/env" ]; then
+            # shellcheck disable=SC1091
+            . "$HOME/.cargo/env"
+          fi
           case "${FLUXER_FLAVOR}" in
             beta|canary|stable) ;;
             *)
