@@ -207,14 +207,7 @@ jobs:
           flutter build ios --release --no-codesign \
             --flavor "${FLUXER_FLAVOR}" \
             --dart-define-from-file="tool/dart_defines/${FLUXER_FLAVOR}.json" \
-            --dart-define=PUSH_PROVIDER=apns \
-            -- \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            DEVELOPMENT_TEAM="" \
-            "PROVISIONING_PROFILE_SPECIFIER=" \
-            CODE_SIGN_STYLE=Manual
+            --dart-define=PUSH_PROVIDER=apns
 
       - name: Package the IPA
         id: package
