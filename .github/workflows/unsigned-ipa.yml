@@ -1,0 +1,264 @@
+name: Unsigned sideloadable IPA
+
+# Builds an unsigned IPA from the official AGPLv3 client:
+# https://github.com/fluxerapp/flutter_client
+# iOS will not launch an unsigned app. Install it with Sideloadly, SideStore,
+# AltStore (your Apple ID re-signs it) or TrollStore on a supported OS.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "fluxerapp/flutter_client branch, tag, or commit"
+        required: false
+        default: beta
+        type: string
+      flavor:
+        description: "App environment. beta and stable use com.fluxer. canary uses com.fluxer.canary."
+        required: true
+        default: beta
+        type: choice
+        options:
+          - beta
+          - canary
+          - stable
+      strip_extensions:
+        description: "Remove share, notification, and broadcast extensions so a free Apple ID can install the IPA"
+        required: false
+        default: true
+        type: boolean
+      publish_release:
+        description: "Attach the IPA to a GitHub Release"
+        required: false
+        default: true
+        type: boolean
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/unsigned-ipa.yml
+      - scripts/**
+
+permissions:
+  contents: write
+
+concurrency:
+  group: unsigned-ipa-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ipa:
+    name: Build unsigned IPA
+    runs-on: xcode-27
+    timeout-minutes: 180
+    env:
+      LANG: en_US.UTF-8
+      LC_ALL: en_US.UTF-8
+      LANGUAGE: en_US.UTF-8
+      FLUXER_REF: ${{ github.event.inputs.ref || 'beta' }}
+      FLUXER_FLAVOR: ${{ github.event.inputs.flavor || 'beta' }}
+      # On a manual run, honor the checkbox. On push, strip extensions.
+      STRIP_EXTENSIONS: ${{ github.event_name != 'workflow_dispatch' && 'true' || github.event.inputs.strip_extensions }}
+      PUBLISH_RELEASE: ${{ github.event_name != 'workflow_dispatch' && 'true' || github.event.inputs.publish_release }}
+      COCOAPODS_DISABLE_STATS: "true"
+    steps:
+      - name: Checkout this builder
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 27
+        run: |
+          set -euo pipefail
+          selected=""
+          for app in /Applications/Xcode_27.1.app /Applications/Xcode_27.app /Applications/Xcode_27.*.app; do
+            if [ -d "${app}/Contents/Developer" ]; then
+              sudo xcode-select -s "${app}/Contents/Developer"
+              selected="${app}"
+              break
+            fi
+          done
+          if [ -z "${selected}" ]; then
+            echo "::error::Xcode 27 is not installed on this runner. Fluxer's iOS project is built with Xcode 27."
+            ls /Applications | grep -i -E 'xcode|Xcode' || true
+            exit 1
+          fi
+          echo "Selected ${selected}"
+          xcodebuild -version
+          xcodebuild -showsdks | grep -E 'iphoneos' || true
+
+      - name: Checkout official Fluxer mobile client
+        uses: actions/checkout@v4
+        with:
+          repository: fluxerapp/flutter_client
+          ref: ${{ env.FLUXER_REF }}
+          path: src
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Sync submodules
+        working-directory: src
+        run: git submodule update --init --recursive
+
+      - name: Record upstream commit
+        id: upstream
+        working-directory: src
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Upstream ${sha}"
+          {
+            echo "### Upstream"
+            echo
+            echo "[\`${sha}\`](https://github.com/fluxerapp/flutter_client/commit/${sha}) on \`${FLUXER_REF}\`, flavor \`${FLUXER_FLAVOR}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Flutter 3.50.0
+        uses: axi92/flutter-action@72633a794ba0b23276fa4fc465a6cacb758a90c5
+        with:
+          channel: stable
+          flutter-version: "3.50.0"
+          cache: true
+
+      - name: Restore pub and cargo caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-fluxer-ios-${{ steps.upstream.outputs.sha }}
+          restore-keys: |
+            ${{ runner.os }}-fluxer-ios-
+
+      - name: Configure the iOS build profile
+        working-directory: src
+        run: dart tool/configure_build.dart --profile=ios-store
+
+      - name: Install Rust
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain stable
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          # shellcheck disable=SC1090
+          . "$HOME/.cargo/env"
+          rustup target add aarch64-apple-ios
+
+      - name: Enable native assets and fetch packages
+        working-directory: src
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1090
+          . "$HOME/.cargo/env"
+          flutter config --enable-native-assets
+          flutter pub get
+
+      - name: Install the pinned native Rust toolchain
+        working-directory: src
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1090
+          . "$HOME/.cargo/env"
+          bash tool/prefetch_native_rust_toolchains.sh
+          if [ -d fluxer ]; then
+            (cd fluxer && rustup toolchain install && rustup target add aarch64-apple-ios)
+          fi
+          while IFS= read -r toolchain; do
+            [ -n "${toolchain}" ] || continue
+            rustup target add --toolchain "${toolchain}" aarch64-apple-ios || true
+          done < <(rustup toolchain list | awk '{print $1}')
+
+      - name: Turn signing off
+        working-directory: src
+        run: bash "$GITHUB_WORKSPACE/scripts/disable_codesign.sh"
+
+      - name: Generate Riverpod code
+        working-directory: src
+        run: dart run build_runner build --delete-conflicting-outputs
+
+      - name: Build the unsigned iOS app
+        working-directory: src
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1090
+          . "$HOME/.cargo/env"
+          case "${FLUXER_FLAVOR}" in
+            beta|canary|stable) ;;
+            *)
+              echo "::error::Flavor must be beta, canary, or stable (got ${FLUXER_FLAVOR})."
+              exit 1
+              ;;
+          esac
+          flutter build ios --release --no-codesign \
+            --flavor "${FLUXER_FLAVOR}" \
+            --dart-define-from-file="tool/dart_defines/${FLUXER_FLAVOR}.json" \
+            --dart-define=PUSH_PROVIDER=apns \
+            -- \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            "PROVISIONING_PROFILE_SPECIFIER=" \
+            CODE_SIGN_STYLE=Manual
+
+      - name: Package the IPA
+        id: package
+        working-directory: src
+        env:
+          FLAVOR: ${{ env.FLUXER_FLAVOR }}
+          STRIP_EXTENSIONS: ${{ env.STRIP_EXTENSIONS }}
+          DIST_DIR: ${{ github.workspace }}/dist
+        run: bash "$GITHUB_WORKSPACE/scripts/package_unsigned_ipa.sh"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fluxer-${{ steps.package.outputs.version }}-${{ env.FLUXER_FLAVOR }}-unsigned
+          path: |
+            dist/*.ipa
+            dist/BUILD_INFO.txt
+            dist/Runner.entitlements
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        if: env.PUBLISH_RELEASE == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ipa-${{ env.FLUXER_FLAVOR }}-${{ steps.package.outputs.version }}-r${{ github.run_number }}
+          name: Fluxer ${{ steps.package.outputs.version }} (${{ env.FLUXER_FLAVOR }}) unsigned IPA
+          prerelease: true
+          make_latest: true
+          generate_release_notes: false
+          body: |
+            Unsigned sideloadable IPA of the official Fluxer iOS client.
+
+            This is **not** an official Fluxer Platform AB download, not TestFlight, and not the App Store build. You have to sign it with your own Apple ID before iOS will install it.
+
+            | | |
+            | --- | --- |
+            | Version | `${{ steps.package.outputs.version }}` (${{ steps.package.outputs.build }}) |
+            | Bundle ID | `${{ steps.package.outputs.bundle }}` |
+            | Flavor | `${{ env.FLUXER_FLAVOR }}` |
+            | Upstream | [`fluxerapp/flutter_client@${{ steps.package.outputs.short_sha }}`](https://github.com/fluxerapp/flutter_client/commit/${{ steps.package.outputs.sha }}) |
+            | Extensions removed | `${{ env.STRIP_EXTENSIONS }}` |
+
+            ### Install
+
+            1. Download the `.ipa` from this release (not the source zip).
+            2. Sign and install it with [Sideloadly](https://sideloadly.io), [SideStore](https://sidestore.io), or AltStore, using your Apple ID. A free Apple ID lasts 7 days, then refresh the install.
+            3. On the iPhone open **Settings → General → VPN & Device Management** and trust the developer.
+            4. On a TrollStore-compatible iOS version you can install this unsigned IPA directly.
+
+            If the App Store or TestFlight build of Fluxer is already installed, the bundle id `${{ steps.package.outputs.bundle }}` will collide. Use the `canary` flavor (`com.fluxer.canary`) or change the bundle id in Sideloadly.
+
+            Push notifications, the share sheet, rich notification images, and in-app screen sharing are not in this default build. They need Apple entitlements a free Apple ID cannot grant. Text chat and calls against fluxer.com (or your own instance) are what this IPA is for.
+
+            The client is AGPLv3. Corresponding source: https://github.com/fluxerapp/flutter_client/tree/${{ steps.package.outputs.sha }}
+          files: |
+            dist/*.ipa
+            dist/BUILD_INFO.txt
+            dist/Runner.entitlements
